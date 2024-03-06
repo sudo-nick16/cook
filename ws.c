@@ -1,3 +1,5 @@
+#include "base64.h"
+#include "sha1.h"
 #include <arpa/inet.h>
 #include <assert.h>
 #include <errno.h>
@@ -11,29 +13,19 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-void ws_die(const char *s) {
-  perror(s);
-  exit(1);
-}
-
-void ws_error(const char *s) { printf("[ERROR] %s: %s\n", s, strerror(errno)); }
-
-void ws_log(const char *s) { printf("[LOG] %s\n", s); }
-
 const static size_t MAX_MSG_LEN = 4096;
 
 typedef struct ws_server_t {
   uint16_t port;
   char *address;
   int server_fd;
-  int *client_fd;
+  int *clients;
   size_t client_n;
+  size_t max_conn;
 } ws_server;
 
 typedef struct ws_client_t {
   int fd;
-  char *req;
-  size_t req_n;
 } Client;
 
 typedef struct ws_header_t {
@@ -47,6 +39,34 @@ typedef struct ws_headers {
   size_t capacity;
 } ws_headers;
 
+typedef struct ws_request_t {
+  char *method;
+  char *path;
+  char *version;
+  ws_headers headers;
+} ws_request_t;
+
+void ws_die(const char *s) {
+  perror(s);
+  exit(1);
+}
+
+void ws_error(const char *s) { printf("[ERROR] %s: %s\n", s, strerror(errno)); }
+
+void ws_log(const char *s) { printf("[LOG] %s\n", s); }
+
+char *ws_concat_str(const char *s1, const char *s2) {
+  assert(s1 != NULL && s2 != NULL && "Provided string should not be NULL");
+  size_t s1_len = strlen(s1);
+  size_t s2_len = strlen(s2);
+  size_t s_len = s1_len + s2_len + 1;
+  char *s = malloc(sizeof(char) * s_len);
+  memset(s, '\0', s_len);
+  strncat(s, s1, s1_len);
+  strncat(s, s2, s2_len);
+  return s;
+}
+
 void ws_headers_append(ws_headers *headers, ws_header_t header) {
   if (headers->count >= headers->capacity) {
     headers->capacity = headers->capacity == 0 ? 2 : headers->capacity * 2;
@@ -57,13 +77,6 @@ void ws_headers_append(ws_headers *headers, ws_header_t header) {
   headers->items[headers->count++] = header;
 }
 
-typedef struct ws_request_t {
-  char *method;
-  char *path;
-  char *version;
-  ws_headers headers;
-} ws_request_t;
-
 void ws_free_request(ws_request_t *req) {
   if (req != NULL) {
     free(req);
@@ -72,10 +85,8 @@ void ws_free_request(ws_request_t *req) {
 }
 
 const size_t http_methods_n = 5;
-// COMMENT: Enum and list must follow same order.
-const char *http_methods[] = {"GET", "POST", "PUT", "PATCH", "DELETE"};
-enum HttpRequest { Get, Post, Put, Patch, Delete };
-
+const char *http_methods[] = {"GET",   "POST",   "PUT",
+                              "PATCH", "DELETE", "OPTIONS"};
 // const size_t http_headers_n = 4;
 // const char *http_headers[] = {"Host", "User-Agent", "Accept",
 // "Content-Type"};
@@ -133,6 +144,19 @@ char *ws_make_token(const char *s, size_t len) {
   return token;
 }
 
+const char *ws_get_header(ws_request_t *req, const char *header) {
+  for (size_t i = 0; i < req->headers.count; ++i) {
+    if (strncmp(req->headers.items[i].key, header, strlen(header)) == 0) {
+      return req->headers.items[i].value;
+    }
+  }
+  return NULL;
+}
+
+void ws_print_header(ws_header_t *hdr) {
+  printf("{%s: %s}\n", hdr->key, hdr->value);
+}
+
 ws_request_t *ws_parse_request(char *buf) {
   // printf("Actual Request:\n%s\n", buf);
   ws_request_t *request = (ws_request_t *)malloc(sizeof(ws_request_t));
@@ -184,6 +208,9 @@ ws_request_t *ws_parse_request(char *buf) {
 
 ws_server ws_server_new(uint16_t port, const char *address) {
   ws_server server = {0};
+  server.max_conn = 1000;
+  int clients[1000] = {0};
+  server.clients = clients;
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd == -1) {
     ws_die("server socket");
@@ -286,7 +313,8 @@ char *ws_headers_to_str(ws_headers *hdrs) {
   assert(hdrs != NULL && "Headers are null.");
   size_t hdrs_len = 0;
   for (size_t i = 0; i < hdrs->count; ++i) {
-    hdrs_len += strlen(hdrs->items[i].key) + strlen(hdrs->items[i].value);
+    hdrs_len += strlen(hdrs->items[i].key) + strlen(hdrs->items[i].value) +
+                strlen(": \r\n");
   }
   // for null terminator
   hdrs_len++;
@@ -295,10 +323,6 @@ char *ws_headers_to_str(ws_headers *hdrs) {
   size_t offset = 0;
   for (size_t i = 0; i < hdrs->count; ++i) {
     ws_header_t h = hdrs->items[i];
-    if (i == hdrs->count - 1) {
-      offset += sprintf(hdrs_str + offset, "%s: %s", h.key, h.value);
-      continue;
-    }
     offset += sprintf(hdrs_str + offset, "%s: %s\r\n", h.key, h.value);
   }
   return hdrs_str;
@@ -310,6 +334,11 @@ ws_header_t ws_make_header(const char *key, const char *val) {
   hdr.value = (char *)val;
   return hdr;
 }
+
+// char *ws_to_char_arr(uint8_t *str) {
+//
+//
+// }
 
 void ws_write_http_response(int fd, uint16_t code, const char *msg,
                             ws_headers *hdrs) {
@@ -335,6 +364,20 @@ void ws_write_http_response(int fd, uint16_t code, const char *msg,
   free(s);
   if (hdrs != NULL) {
     free(headers);
+  }
+}
+
+size_t ws_add_client(ws_server *server, int client_fd) {
+  if (server->client_n < server->max_conn) {
+    server->clients[server->client_n++] = client_fd;
+    return server->client_n - 1;
+  }
+  assert(false && "TODO: Handle more than max connections.");
+}
+
+void ws_broadcast_ws_msg(ws_server *server, char *msg) {
+  for (size_t i = 0; i < server->client_n; ++i) {
+    write(server->clients[i], msg, strlen(msg));
   }
 }
 
@@ -364,11 +407,48 @@ void ws_server_start(ws_server *server) {
     if (!ws_is_websocket_conn(req)) {
       ws_log("Not a websocket connection");
     }
+    const char *magic_no = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    const char *sec_ws_key = ws_get_header(req, "Sec-WebSocket-Key");
+    if (sec_ws_key == NULL) {
+      ws_log("Sec-WebSocket-Key header is missing.");
+      ws_headers hdrs = {0};
+      ws_headers_append(&hdrs, ws_make_header("fuck", "off"));
+      ws_write_http_response(client_fd, 400, "Bad websocket request", &hdrs);
+      ws_close_connection(client_fd);
+      continue;
+    }
+
+    char *new_key = ws_concat_str(sec_ws_key, magic_no);
+    uint8_t *hash = malloc(sizeof(uint8_t) * 20);
+    printf("New Key: %s\n", new_key);
+
+    SHA1Context sha1 = {0};
+    SHA1Reset(&sha1);
+    SHA1Input(&sha1, (uint8_t *)new_key, strlen(new_key));
+    SHA1Result(&sha1, hash);
+
+    printf("Hash: ");
+    for (int i = 0; i < 20; ++i) {
+      printf("%x", hash[i]);
+    }
+    printf("\n");
+
+    char *hash_value = (char *)malloc(40 * sizeof(char));
+    memset(hash_value, '\0', 40);
+    Base64encode(hash_value, (char *)hash, strlen((char *)hash));
+    printf("Base64 encoded value: %s\n", hash_value);
+
     ws_headers headers = {0};
     ws_headers_append(&headers, ws_make_header("Upgrade", "websocket"));
     ws_headers_append(&headers, ws_make_header("Connection", "Upgrade"));
+    ws_headers_append(&headers,
+                      ws_make_header("Sec-WebSocket-Accept", hash_value));
+
     ws_write_http_response(client_fd, 101, "", &headers);
-    ws_close_connection(client_fd);
+    ws_add_client(server, client_fd);
+		// send web socket frame in msg
+    free(hash_value);
+    // ws_close_connection(client_fd);
   }
 }
 
