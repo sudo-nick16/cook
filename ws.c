@@ -2,8 +2,10 @@
 #include "sha1.h"
 #include <arpa/inet.h>
 #include <assert.h>
+#include <endian.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -14,6 +16,7 @@
 #include <unistd.h>
 
 const static size_t MAX_MSG_LEN = 4096;
+const char *magic_no = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 typedef struct ws_server_t {
   uint16_t port;
@@ -45,6 +48,43 @@ typedef struct ws_request_t {
   char *version;
   ws_headers headers;
 } ws_request_t;
+
+typedef struct __attribute__((__packed__)) {
+  uint8_t opcode : 4;
+  uint8_t rsv3 : 1;
+  uint8_t rsv2 : 1;
+  uint8_t rsv1 : 1;
+  uint8_t fin : 1;
+
+  uint8_t payload_len : 7;
+  uint8_t masked : 1;
+  // uint16_t ext_payload_len; // TODO: Handle dynamic ext payload len
+  // uint32_t mask_key; // no masking for now
+  // uint8_t *payload_data; // TODO: Handle dynamic payload data
+} ws_frame_t;
+
+ws_frame_t ws_make_ws_frame(size_t payload_len) {
+  ws_frame_t frame = {0};
+  frame.fin = 1;
+  printf("fin: %u\n", frame.fin);
+  frame.rsv1 = 0;
+  printf("rsv1: %u\n", frame.rsv1);
+  frame.rsv2 = 0;
+  printf("rsv2: %u\n", frame.rsv2);
+  frame.rsv3 = 0;
+  printf("rsv3: %u\n", frame.rsv3);
+  frame.opcode = 1;
+  printf("opcode: %x\n", frame.opcode);
+  frame.masked = 0;
+  printf("masked: %u\n", frame.masked);
+  frame.payload_len = payload_len;
+  printf("payload len: %u\n", frame.payload_len);
+  // frame.ext_payload_len = htobe16(strlen(payload));
+  // printf("ext payload len: %u\n", frame.ext_payload_len);
+  // frame.payload_data = (uint8_t *)payload;
+  // printf("payload data: %s\n", frame.payload_data);
+  return frame;
+}
 
 void ws_die(const char *s) {
   perror(s);
@@ -377,7 +417,9 @@ size_t ws_add_client(ws_server *server, int client_fd) {
 
 void ws_broadcast_ws_msg(ws_server *server, char *msg) {
   for (size_t i = 0; i < server->client_n; ++i) {
-    write(server->clients[i], msg, strlen(msg));
+    if (write(server->clients[i], msg, strlen(msg)) == -1) {
+      ws_error("Could not write to the connection");
+    };
   }
 }
 
@@ -407,7 +449,6 @@ void ws_server_start(ws_server *server) {
     if (!ws_is_websocket_conn(req)) {
       ws_log("Not a websocket connection");
     }
-    const char *magic_no = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     const char *sec_ws_key = ws_get_header(req, "Sec-WebSocket-Key");
     if (sec_ws_key == NULL) {
       ws_log("Sec-WebSocket-Key header is missing.");
@@ -446,7 +487,26 @@ void ws_server_start(ws_server *server) {
 
     ws_write_http_response(client_fd, 101, "", &headers);
     ws_add_client(server, client_fd);
-		// send web socket frame in msg
+    // send web socket frame in msg
+    printf("Size of frame type: %zu\n", sizeof(ws_frame_t));
+
+    char *payload = "hello world";
+
+    ws_frame_t frame = ws_make_ws_frame(strlen(payload));
+
+    size_t msg_len = sizeof(frame) + strlen(payload) + 1;
+    unsigned char *msg = (unsigned char *)malloc(msg_len);
+
+    memset(msg, '\0', msg_len);
+    memcpy(msg, &frame, sizeof(frame));
+    strncat((char *)msg, payload, strlen(payload));
+    printf("Frame(%zu): %s\n", msg_len, (unsigned char *)msg);
+
+    if (write(client_fd, msg, msg_len) == -1) {
+      ws_error("Could not write to the connection");
+    }
+
+    free(msg);
     free(hash_value);
     // ws_close_connection(client_fd);
   }
