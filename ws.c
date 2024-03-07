@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 const static size_t MAX_MSG_LEN = 4096;
-const char *magic_no = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const char *ws_magic_no = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 typedef struct ws_server_t {
   uint16_t port;
@@ -58,31 +58,50 @@ typedef struct __attribute__((__packed__)) {
 
   uint8_t payload_len : 7;
   uint8_t masked : 1;
-  // uint16_t ext_payload_len; // TODO: Handle dynamic ext payload len
+
+  union {
+    uint16_t len16 : 16;
+    uint64_t len64 : 64;
+  } ext_payload_len;
+
   // uint32_t mask_key; // no masking for now
-  // uint8_t *payload_data; // TODO: Handle dynamic payload data
+  // uint8_t *payload_data; // Handling dynamic payload data outside the struct
 } ws_frame_t;
 
-ws_frame_t ws_make_ws_frame(size_t payload_len) {
+#define O_FIN 0x80          // b10000000
+#define O_FIN 0x80          // b10000000
+#define O_RSV1 0x40         // b01000000
+#define O_RSV2 0x20         // b00100000
+#define O_RSV3 0x10         // b00010000
+#define O_OPCODE_TXT 0x01   // b00000001
+#define O_OPCODE_BIN 0x02   // b00000010
+#define O_OPCODE_CLOSE 0x08 // b00001000
+#define O_OPCODE_PING 0x09  // b00001001
+#define O_OPCODE_PONG 0x0A  // b00001010
+#define O_OPCODE_ALL 0x0F   // b00001111
+
+// OPTIONS: (8 bits)
+// fin/cont (1 bit), rsv1 (1 bit), rsv2 (1 bit), rsv3 (1 bit), opcode (4 bits)
+ws_frame_t ws_make_ws_frame(size_t payload_len, uint8_t options) {
   ws_frame_t frame = {0};
-  frame.fin = 1;
-  printf("fin: %u\n", frame.fin);
-  frame.rsv1 = 0;
-  printf("rsv1: %u\n", frame.rsv1);
-  frame.rsv2 = 0;
-  printf("rsv2: %u\n", frame.rsv2);
-  frame.rsv3 = 0;
-  printf("rsv3: %u\n", frame.rsv3);
-  frame.opcode = 1;
-  printf("opcode: %x\n", frame.opcode);
+  frame.fin = (options & O_FIN) >> 7;
+  frame.rsv1 = (options & O_RSV1) >> 6;
+  frame.rsv2 = (options & O_RSV2) >> 5;
+  frame.rsv3 = (options & O_RSV3) >> 4;
+  frame.opcode = (options & O_OPCODE_ALL);
   frame.masked = 0;
-  printf("masked: %u\n", frame.masked);
-  frame.payload_len = payload_len;
-  printf("payload len: %u\n", frame.payload_len);
-  // frame.ext_payload_len = htobe16(strlen(payload));
-  // printf("ext payload len: %u\n", frame.ext_payload_len);
-  // frame.payload_data = (uint8_t *)payload;
-  // printf("payload data: %s\n", frame.payload_data);
+  if (payload_len < 126) {
+    frame.payload_len = payload_len;
+  } else if (payload_len < 65536) {
+    frame.payload_len = 126;
+    frame.ext_payload_len.len16 = htobe16(payload_len);
+  } else {
+    // no payload length will ever be this big!
+    // assert(payload_len < (uint64_t)18446744073709551615 &&
+    //        "Payload length exceeds 64 bit integer.");
+    frame.payload_len = 127;
+    frame.ext_payload_len.len64 = htobe64(payload_len);
+  }
   return frame;
 }
 
@@ -375,11 +394,6 @@ ws_header_t ws_make_header(const char *key, const char *val) {
   return hdr;
 }
 
-// char *ws_to_char_arr(uint8_t *str) {
-//
-//
-// }
-
 void ws_write_http_response(int fd, uint16_t code, const char *msg,
                             ws_headers *hdrs) {
   assert(msg != NULL && "Message should not be NULL");
@@ -423,6 +437,101 @@ void ws_broadcast_ws_msg(ws_server *server, char *msg) {
   }
 }
 
+void ws_print_ws_frame(ws_frame_t *frame) {
+  printf("fin: %u\n", frame->fin);
+  printf("rsv1: %u\n", frame->rsv1);
+  printf("rsv2: %u\n", frame->rsv2);
+  printf("rsv3: %u\n", frame->rsv3);
+  printf("opcode: %x\n", frame->opcode);
+  printf("masked: %u\n", frame->masked);
+  printf("payload len: %u\n", frame->payload_len);
+  if (frame->payload_len == 126) {
+    printf("ext payload len: %u (%u)\n", be16toh(frame->ext_payload_len.len16),
+           frame->ext_payload_len.len16);
+  }
+  if (frame->payload_len == 127) {
+    printf("ext payload len: %lu (%lu)\n",
+           be64toh(frame->ext_payload_len.len64), frame->ext_payload_len.len64);
+  }
+}
+
+void ws_print_hex_arr(const uint8_t *frame) {
+  for (size_t i = 0; i < strlen((char *)frame); ++i) {
+    printf("%x ", frame[i]);
+  }
+}
+
+// uint8_t *ws_merge_frame_payload(void *frame, const char *msg) {
+//   size_t payload_len = sizeof(*frame) + strlen(msg) + 1;
+//   uint8_t *payload = (uint8_t *)malloc(payload_len);
+//   memset(payload, '\0', payload_len);
+//   memcpy(payload, frame, sizeof(*frame));
+//   strncat((char *)payload, msg, strlen(msg));
+//   return payload;
+// }
+
+int8_t ws_send_ws_msg(int client_fd, const char *msg) {
+  size_t payload_len = strlen(msg) + 1;
+  printf("Payload len: %zu\n", payload_len);
+
+  ws_frame_t frame = ws_make_ws_frame(payload_len, O_FIN | O_OPCODE_TXT);
+  ws_print_ws_frame(&frame);
+
+  size_t frame_len = sizeof(frame) + payload_len;
+
+  uint8_t *frame_data = (uint8_t *)malloc(frame_len);
+
+  memset(frame_data, '\0', frame_len);
+  size_t offset = 0;
+
+  if (frame.payload_len < 126) {
+    offset += 2;
+    memcpy(frame_data, &frame, 2);
+  }
+  if (frame.payload_len == 126) {
+    offset += 4;
+    memcpy(frame_data, &frame, 4);
+  }
+  if (frame.payload_len == 127) {
+    offset += 10;
+    memcpy(frame_data, &frame, 10);
+  }
+  memcpy(frame_data + offset, msg, strlen(msg));
+
+  if (write(client_fd, frame_data, frame_len) == -1) {
+    ws_error("Could not write to the connection");
+    return -1;
+  }
+  return 0;
+}
+
+char *ws_make_accept_key(const char *sec_ws_key) {
+  char *new_key = ws_concat_str(sec_ws_key, ws_magic_no);
+  printf("New Key: %s\n", new_key);
+
+  char *hash = malloc(sizeof(uint8_t) * 20);
+  SHA1Context sha1 = {0};
+  SHA1Reset(&sha1);
+  SHA1Input(&sha1, (uint8_t *)new_key, strlen(new_key));
+  SHA1Result(&sha1, (uint8_t *)hash);
+
+  char *enc_key = (char *)malloc(40 * sizeof(char));
+  memset(enc_key, '\0', 40);
+  Base64encode(enc_key, hash, strlen(hash));
+  printf("Base64 encoded value: %s\n", enc_key);
+
+  free(hash);
+  free(new_key);
+
+  return enc_key;
+}
+
+void ws_free_headers(ws_headers *hdrs) {
+  free(hdrs->items);
+  hdrs->count = 0;
+  hdrs->capacity = 0;
+}
+
 void ws_server_start(ws_server *server) {
   while (true) {
     struct sockaddr_in addr = {0};
@@ -453,61 +562,29 @@ void ws_server_start(ws_server *server) {
     if (sec_ws_key == NULL) {
       ws_log("Sec-WebSocket-Key header is missing.");
       ws_headers hdrs = {0};
-      ws_headers_append(&hdrs, ws_make_header("fuck", "off"));
-      ws_write_http_response(client_fd, 400, "Bad websocket request", &hdrs);
+      ws_headers_append(&hdrs, ws_make_header("Content-Type", "json"));
+      ws_write_http_response(
+          client_fd, 400, "{\"error\": \"we shill websocket connection sir.\"}",
+          &hdrs);
+      ws_free_headers(&hdrs);
       ws_close_connection(client_fd);
       continue;
     }
 
-    char *new_key = ws_concat_str(sec_ws_key, magic_no);
-    uint8_t *hash = malloc(sizeof(uint8_t) * 20);
-    printf("New Key: %s\n", new_key);
-
-    SHA1Context sha1 = {0};
-    SHA1Reset(&sha1);
-    SHA1Input(&sha1, (uint8_t *)new_key, strlen(new_key));
-    SHA1Result(&sha1, hash);
-
-    printf("Hash: ");
-    for (int i = 0; i < 20; ++i) {
-      printf("%x", hash[i]);
-    }
-    printf("\n");
-
-    char *hash_value = (char *)malloc(40 * sizeof(char));
-    memset(hash_value, '\0', 40);
-    Base64encode(hash_value, (char *)hash, strlen((char *)hash));
-    printf("Base64 encoded value: %s\n", hash_value);
+    char *accept_key = ws_make_accept_key(sec_ws_key);
 
     ws_headers headers = {0};
     ws_headers_append(&headers, ws_make_header("Upgrade", "websocket"));
     ws_headers_append(&headers, ws_make_header("Connection", "Upgrade"));
     ws_headers_append(&headers,
-                      ws_make_header("Sec-WebSocket-Accept", hash_value));
+                      ws_make_header("Sec-WebSocket-Accept", accept_key));
 
     ws_write_http_response(client_fd, 101, "", &headers);
+    ws_free_headers(&headers);
     ws_add_client(server, client_fd);
-    // send web socket frame in msg
-    printf("Size of frame type: %zu\n", sizeof(ws_frame_t));
 
-    char *payload = "hello world";
+    ws_send_ws_msg(client_fd, "");
 
-    ws_frame_t frame = ws_make_ws_frame(strlen(payload));
-
-    size_t msg_len = sizeof(frame) + strlen(payload) + 1;
-    unsigned char *msg = (unsigned char *)malloc(msg_len);
-
-    memset(msg, '\0', msg_len);
-    memcpy(msg, &frame, sizeof(frame));
-    strncat((char *)msg, payload, strlen(payload));
-    printf("Frame(%zu): %s\n", msg_len, (unsigned char *)msg);
-
-    if (write(client_fd, msg, msg_len) == -1) {
-      ws_error("Could not write to the connection");
-    }
-
-    free(msg);
-    free(hash_value);
     // ws_close_connection(client_fd);
   }
 }
