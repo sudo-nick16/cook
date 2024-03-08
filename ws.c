@@ -68,7 +68,11 @@ typedef struct __attribute__((__packed__)) {
   // uint8_t *payload_data; // Handling dynamic payload data outside the struct
 } ws_frame_t;
 
-#define O_FIN 0x80          // b10000000
+typedef struct ws_frame_data_t {
+  ws_frame_t frame;
+  char *payload;
+} ws_frame_data_t;
+
 #define O_FIN 0x80          // b10000000
 #define O_RSV1 0x40         // b01000000
 #define O_RSV2 0x20         // b00100000
@@ -79,6 +83,8 @@ typedef struct __attribute__((__packed__)) {
 #define O_OPCODE_PING 0x09  // b00001001
 #define O_OPCODE_PONG 0x0A  // b00001010
 #define O_OPCODE_ALL 0x0F   // b00001111
+#define M_PAYLOAD_LEN 0x7F  // b01111111
+#define M_MASK 0x80         // b10000000
 
 // OPTIONS: (8 bits)
 // fin/cont (1 bit), rsv1 (1 bit), rsv2 (1 bit), rsv3 (1 bit), opcode (4 bits)
@@ -103,6 +109,13 @@ ws_frame_t ws_make_ws_frame(size_t payload_len, uint8_t options) {
     frame.ext_payload_len.len64 = htobe64(payload_len);
   }
   return frame;
+}
+
+ws_frame_data_t ws_make_ws_frame_data(uint8_t *payload, uint8_t options) {
+  ws_frame_data_t frame_data = {0};
+  frame_data.frame = ws_make_ws_frame(strlen((char *)payload), options);
+  frame_data.payload = (char *)payload;
+  return frame_data;
 }
 
 void ws_die(const char *s) {
@@ -136,19 +149,9 @@ void ws_headers_append(ws_headers *headers, ws_header_t header) {
   headers->items[headers->count++] = header;
 }
 
-void ws_free_request(ws_request_t *req) {
-  if (req != NULL) {
-    free(req);
-    req = NULL;
-  }
-}
-
 const size_t http_methods_n = 5;
 const char *http_methods[] = {"GET",   "POST",   "PUT",
                               "PATCH", "DELETE", "OPTIONS"};
-// const size_t http_headers_n = 4;
-// const char *http_headers[] = {"Host", "User-Agent", "Accept",
-// "Content-Type"};
 
 size_t ws_parse_http_method(const char *s) {
   for (size_t i = 0; i < http_methods_n; ++i) {
@@ -167,15 +170,6 @@ bool ws_is_valid_http_method(const char *s) {
   }
   return false;
 }
-
-// bool ws_is_valid_http_header(const char *s) {
-//   for (size_t i = 0; i < http_headers_n; ++i) {
-//     if (strncmp(s, http_headers[i], strlen(http_headers[i])) == 0) {
-//       return true;
-//     }
-//   }
-//   return false;
-// }
 
 bool ws_is_valid_http_version(const char *s) {
   if (strncmp(s, "HTTP/1.1", 8) == 0) {
@@ -265,7 +259,7 @@ ws_request_t *ws_parse_request(char *buf) {
   return request;
 }
 
-ws_server ws_server_new(uint16_t port, const char *address) {
+ws_server ws_server_new(const uint16_t port, const char *address) {
   ws_server server = {0};
   server.max_conn = 1000;
   int clients[1000] = {0};
@@ -318,7 +312,7 @@ static const ws_status_t status_map[ws_status_n] = {
     {400, "Bad Request"},
 };
 
-const char *ws_get_status_reason(uint16_t code) {
+const char *ws_get_status_reason(const uint16_t code) {
   size_t i = 0;
   for (; i < ws_status_n - 1; ++i) {
     if (code >= status_map[i].code && code < status_map[i + 1].code) {
@@ -362,7 +356,7 @@ bool ws_is_websocket_conn(ws_request_t *req) {
   return true;
 }
 
-void ws_close_connection(int fd) {
+void ws_close_connection(const int fd) {
   if (close(fd) == -1) {
     ws_error("Could not close connection");
   };
@@ -394,7 +388,7 @@ ws_header_t ws_make_header(const char *key, const char *val) {
   return hdr;
 }
 
-void ws_write_http_response(int fd, uint16_t code, const char *msg,
+void ws_write_http_response(const int fd, uint16_t code, const char *msg,
                             ws_headers *hdrs) {
   assert(msg != NULL && "Message should not be NULL");
   const char *reason = ws_get_status_reason(code);
@@ -438,6 +432,7 @@ void ws_broadcast_ws_msg(ws_server *server, char *msg) {
 }
 
 void ws_print_ws_frame(ws_frame_t *frame) {
+  assert(frame != NULL && "Cannot print frame = NULL");
   printf("fin: %u\n", frame->fin);
   printf("rsv1: %u\n", frame->rsv1);
   printf("rsv2: %u\n", frame->rsv2);
@@ -469,36 +464,42 @@ void ws_print_hex_arr(const uint8_t *frame) {
 //   strncat((char *)payload, msg, strlen(msg));
 //   return payload;
 // }
+//
 
-int8_t ws_send_ws_msg(int client_fd, const char *msg) {
-  size_t payload_len = strlen(msg) + 1;
-  printf("Payload len: %zu\n", payload_len);
-
-  ws_frame_t frame = ws_make_ws_frame(payload_len, O_FIN | O_OPCODE_TXT);
-  ws_print_ws_frame(&frame);
-
-  size_t frame_len = sizeof(frame) + payload_len;
-
+uint8_t *ws_serialize_ws_frame(ws_frame_data_t *frame) {
+  assert(frame != NULL && "Cannot serialize for frame = NULL.");
+  size_t payload_len = frame->frame.payload_len;
+  if (payload_len == 126) {
+    payload_len = frame->frame.ext_payload_len.len16;
+  }
+  if (payload_len == 127) {
+    payload_len = frame->frame.ext_payload_len.len64;
+  }
+  size_t frame_len = sizeof(ws_frame_data_t) + payload_len;
   uint8_t *frame_data = (uint8_t *)malloc(frame_len);
-
   memset(frame_data, '\0', frame_len);
   size_t offset = 0;
-
-  if (frame.payload_len < 126) {
+  if (frame->frame.payload_len < 126) {
     offset += 2;
-    memcpy(frame_data, &frame, 2);
+    memcpy(frame_data, frame, 2);
   }
-  if (frame.payload_len == 126) {
+  if (frame->frame.payload_len == 126) {
     offset += 4;
-    memcpy(frame_data, &frame, 4);
+    memcpy(frame_data, frame, 4);
   }
-  if (frame.payload_len == 127) {
+  if (frame->frame.payload_len == 127) {
     offset += 10;
-    memcpy(frame_data, &frame, 10);
+    memcpy(frame_data, frame, 10);
   }
-  memcpy(frame_data + offset, msg, strlen(msg));
+  memcpy(frame_data + offset, frame->payload, payload_len);
+  return frame_data;
+}
 
-  if (write(client_fd, frame_data, frame_len) == -1) {
+int8_t ws_send_ws_msg(int client_fd, const char *msg, uint8_t options) {
+  ws_frame_data_t frame_data = ws_make_ws_frame_data((uint8_t *)msg, options);
+  uint8_t *serialized_frame = ws_serialize_ws_frame(&frame_data);
+  if (write(client_fd, serialized_frame, strlen((char *)serialized_frame)) ==
+      -1) {
     ws_error("Could not write to the connection");
     return -1;
   }
@@ -506,10 +507,10 @@ int8_t ws_send_ws_msg(int client_fd, const char *msg) {
 }
 
 char *ws_make_accept_key(const char *sec_ws_key) {
+  assert(sec_ws_key != NULL && "Sec-WebSocket-Key should not be NULL");
   char *new_key = ws_concat_str(sec_ws_key, ws_magic_no);
-  printf("New Key: %s\n", new_key);
-
   char *hash = malloc(sizeof(uint8_t) * 20);
+
   SHA1Context sha1 = {0};
   SHA1Reset(&sha1);
   SHA1Input(&sha1, (uint8_t *)new_key, strlen(new_key));
@@ -517,25 +518,98 @@ char *ws_make_accept_key(const char *sec_ws_key) {
 
   char *enc_key = (char *)malloc(40 * sizeof(char));
   memset(enc_key, '\0', 40);
+
   Base64encode(enc_key, hash, strlen(hash));
-  printf("Base64 encoded value: %s\n", enc_key);
 
   free(hash);
   free(new_key);
-
   return enc_key;
 }
 
 void ws_free_headers(ws_headers *hdrs) {
-  free(hdrs->items);
-  hdrs->count = 0;
-  hdrs->capacity = 0;
+  if (hdrs != NULL) {
+    free(hdrs->items);
+    hdrs->count = 0;
+    hdrs->capacity = 0;
+  }
+}
+
+void ws_free_request(ws_request_t *req) {
+  if (req != NULL) {
+    ws_free_headers(&req->headers);
+    free(req);
+    req = NULL;
+  }
+}
+
+char *ws_unmask_payload(char *s, uint8_t *mask_key) {
+  size_t len = strlen(s);
+  for (size_t i = 0; i < len; ++i) {
+    s[i] = s[i] ^ mask_key[i % 4];
+  }
+  return s;
+}
+
+ws_frame_data_t ws_parse_ws_frame(uint8_t *buf) {
+  assert(buf != NULL && "Buffer should not be NULL");
+  ws_frame_data_t frame_data;
+  ws_frame_t frame = {0};
+  frame.fin = (buf[0] & O_FIN) >> 7;
+  frame.rsv1 = (buf[0] & O_RSV1) >> 6;
+  frame.rsv2 = (buf[0] & O_RSV2) >> 5;
+  frame.rsv3 = (buf[0] & O_RSV3) >> 4;
+  frame.opcode = (buf[0] & O_OPCODE_ALL);
+  frame.masked = (buf[1] & M_MASK) >> 7;
+  frame.payload_len = (buf[1] & M_PAYLOAD_LEN);
+  size_t payload_len = 0;
+  char *payload = NULL;
+  size_t offset = 2;
+  if (frame.payload_len < 126) {
+    payload_len = frame.payload_len;
+    payload = (char *)malloc(frame.payload_len * sizeof(char));
+  } else if (frame.payload_len == 126) {
+    frame.ext_payload_len.len16 = be16toh(*(uint16_t *)(buf + 2));
+    payload_len = frame.ext_payload_len.len16;
+    payload = (char *)malloc(frame.ext_payload_len.len16 * sizeof(char));
+    offset += 2;
+  } else if (frame.payload_len == 127) {
+    frame.ext_payload_len.len64 = be64toh(*(uint64_t *)(buf + 2));
+    payload_len = frame.ext_payload_len.len64;
+    payload = (char *)malloc(frame.ext_payload_len.len64 * sizeof(char));
+    offset += 8;
+  }
+  uint8_t mask_key[4] = {0};
+  if (frame.masked) {
+    memcpy(mask_key, buf + offset, 4);
+    offset += 4;
+  }
+  memcpy(payload, buf + offset, payload_len);
+  if (frame.masked) {
+    ws_unmask_payload(payload, mask_key);
+  }
+  frame_data.frame = frame;
+  frame_data.payload = payload;
+  return frame_data;
+}
+
+void ws_print_ws_frame_data(ws_frame_data_t *frame_data) {
+  assert(frame_data != NULL && "Cannot print frame data = NULL");
+  ws_print_ws_frame(&frame_data->frame);
+  printf("Payload: %s\n", frame_data->payload);
+}
+
+void free_ws_frame_data(ws_frame_data_t *frame_data) {
+  assert(frame_data != NULL && "Cannot free frame data = NULL");
+  if (frame_data != NULL) {
+    free(frame_data->payload);
+  }
 }
 
 void ws_server_start(ws_server *server) {
   while (true) {
     struct sockaddr_in addr = {0};
     socklen_t addr_len = sizeof(addr);
+    ws_log("Waiting for connections");
     int client_fd =
         accept(server->server_fd, (struct sockaddr *)&addr, &addr_len);
     if (client_fd == -1) {
@@ -570,9 +644,7 @@ void ws_server_start(ws_server *server) {
       ws_close_connection(client_fd);
       continue;
     }
-
     char *accept_key = ws_make_accept_key(sec_ws_key);
-
     ws_headers headers = {0};
     ws_headers_append(&headers, ws_make_header("Upgrade", "websocket"));
     ws_headers_append(&headers, ws_make_header("Connection", "Upgrade"));
@@ -583,8 +655,19 @@ void ws_server_start(ws_server *server) {
     ws_free_headers(&headers);
     ws_add_client(server, client_fd);
 
-    ws_send_ws_msg(client_fd, "");
+    ws_send_ws_msg(client_fd, "hello world", O_OPCODE_TXT | O_FIN);
 
+    char *buff = (char *)malloc(MAX_MSG_LEN * sizeof(char));
+    memset(buff, '\0', MAX_MSG_LEN);
+
+    ws_log("Waiting for messages");
+    while (recv(client_fd, buff, n, 0) > 0) {
+      ws_frame_data_t frame_data = ws_parse_ws_frame((uint8_t *)buff);
+      printf("Received: %s\n", frame_data.payload);
+      memset(buff, '\0', MAX_MSG_LEN);
+    }
+    ws_log("Connection closed");
+    free(buff);
     // ws_close_connection(client_fd);
   }
 }
