@@ -1,69 +1,7 @@
-#include "base64.h"
-#include "sha1.h"
-#include <arpa/inet.h>
-#include <assert.h>
-#include <endian.h>
-#include <errno.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "ws.h"
 
-const static size_t MAX_MSG_LEN = 125 * 1024;
-const char *ws_magic_no = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-typedef struct ws_server_t {
-  uint16_t port;
-  char *address;
-  int server_fd;
-  int *clients;
-  size_t client_n;
-  size_t max_conn;
-} ws_server;
-
-typedef struct ws_client_t {
-  int fd;
-} Client;
-
-typedef struct ws_header_t {
-  char *key;
-  char *value;
-} ws_header_t;
-
-typedef struct ws_headers {
-  ws_header_t *items;
-  size_t count;
-  size_t capacity;
-} ws_headers;
-
-typedef struct ws_request_t {
-  char *method;
-  char *path;
-  char *version;
-  ws_headers headers;
-} ws_request_t;
-
-typedef struct __attribute__((__packed__)) {
-  uint8_t opcode : 4;
-  uint8_t rsv3 : 1;
-  uint8_t rsv2 : 1;
-  uint8_t rsv1 : 1;
-  uint8_t fin : 1;
-  uint8_t payload_len : 7;
-  uint8_t masked : 1;
-  union {
-    uint16_t len16 : 16;
-    uint64_t len64 : 64;
-  } ext_payload_len;
-  uint8_t mask_key[4];
-  uint8_t *payload;
-} ws_frame_t; // 22 bytes
+static const size_t MAX_MSG_LEN = 125 * 1024;
+static const char *ws_magic_no = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 size_t ws_get_payload_len(ws_frame_t *frame) {
   if (frame->payload_len == 126) {
@@ -130,6 +68,11 @@ void ws_die(const char *s) {
 }
 
 void ws_error(const char *s) { printf("[ERROR] %s: %s\n", s, strerror(errno)); }
+
+void ws_panic(const char *s) {
+  printf("[PANIC] %s: %s\n", s, strerror(errno));
+  exit(1);
+}
 
 void ws_log(const char *s) { printf("[LOG] %s\n", s); }
 
@@ -264,22 +207,39 @@ ws_request_t *ws_parse_request(char *buf) {
   return request;
 }
 
-ws_server ws_server_new(const uint16_t port, const char *address) {
-  ws_server server = {0};
+int setnonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  flags |= O_NONBLOCK;
+  if (fcntl(fd, F_SETFL, flags) == -1) {
+    return -1;
+  }
+  return 0;
+}
+
+ws_server_t ws_server_new(const uint16_t port, const char *address) {
+  ws_server_t server = {0};
+  server.port = port;
+  server.address = (char *)address;
   server.max_conn = 1000;
-  int clients[1000] = {0};
+  int client_fds[server.max_conn];
+  server.client_fds = client_fds;
+  server.client_n = 0;
+  ws_clients clients = {
+      .count = 0,
+      .capacity = 0,
+      .items = (ws_client_t *)malloc(sizeof(ws_client_t) * server.max_conn)};
   server.clients = clients;
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd == -1) {
-    ws_die("server socket");
+    ws_panic("Could not create socket");
   }
   int option_value = 1;
   if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &option_value,
                  sizeof(int)) == -1) {
-    ws_die("server setsocketopt");
+    ws_panic("Could not set socket options");
   };
-  server.server_fd = fd;
-
+  setnonblocking(fd);
+  server.fd = fd;
   struct sockaddr_in addr = {0};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
@@ -287,10 +247,10 @@ ws_server ws_server_new(const uint16_t port, const char *address) {
   socklen_t addr_len = sizeof(addr);
 
   if (bind(fd, (struct sockaddr *)&addr, addr_len) == -1) {
-    ws_die("server bind");
+    ws_panic("Could not bind");
   };
   if (listen(fd, 4096) == -1) {
-    ws_die("server listen");
+    ws_panic("Could not listen");
   };
   return server;
 }
@@ -391,8 +351,8 @@ ws_header_t ws_make_header(const char *key, const char *val) {
   return hdr;
 }
 
-void ws_write_http_response(const int fd, uint16_t code, const char *msg,
-                            ws_headers *hdrs) {
+int ws_write_http_response(const int fd, uint16_t code, const char *msg,
+                           ws_headers *hdrs) {
   assert(msg != NULL && "Message should not be NULL");
   const char *reason = ws_get_status_reason(code);
   const char *http_version = "HTTP/1.1";
@@ -408,30 +368,51 @@ void ws_write_http_response(const int fd, uint16_t code, const char *msg,
   char *s = malloc(MAX_MSG_LEN);
   memset(s, '\0', MAX_MSG_LEN);
   sprintf(s, "%s %u %s\r\n%s\r\n%s", http_version, code, reason, headers, msg);
-  if (write(fd, s, strlen(s)) == -1) {
+  int n = write(fd, s, strlen(s));
+  if (n == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      ws_log("could not write to the socket bc eagain or would block.");
+    }
     ws_error("Could not write to the connection");
+    return -1;
   }
   printf("Response:\n%s\n", s);
   free(s);
   if (hdrs != NULL) {
     free(headers);
   }
+  return 0;
 }
 
-size_t ws_add_client(ws_server *server, int client_fd) {
-  if (server->client_n < server->max_conn) {
-    server->clients[server->client_n++] = client_fd;
-    return server->client_n - 1;
+void ws_clients_append(ws_clients *clients, ws_client_t client) {
+  if (clients->count >= clients->capacity) {
+    clients->capacity = clients->capacity == 0 ? 2 : clients->capacity * 2;
+    clients->items = (ws_client_t *)realloc(
+        clients->items, clients->capacity * sizeof(ws_client_t));
+    assert(clients != NULL && "Null after reallocation");
   }
-  assert(false && "TODO: Handle more than max connections.");
+  clients->items[clients->count++] = client;
 }
 
-void ws_broadcast_ws_msg(ws_server *server, char *msg) {
-  for (size_t i = 0; i < server->client_n; ++i) {
-    if (write(server->clients[i], msg, strlen(msg)) == -1) {
-      ws_error("Could not write to the connection");
-    };
-  }
+void ws_add_client(ws_server_t *server, ws_client_t client) {
+  assert(server != NULL && "Server should not be NULL");
+  ws_clients_append(&server->clients, client);
+}
+
+void ws_add_client_fd(ws_server_t *server, int fd) {
+  assert(server != NULL && "Server should not be NULL");
+  server->client_fds[server->client_n++] = fd;
+}
+
+ws_client_t ws_make_client(int fd, struct sockaddr_in addr, socklen_t len) {
+  char address[20], port[10];
+  if (getnameinfo((struct sockaddr *)&addr, len, address, 20, port, 10,
+                  NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+    printf("Acception connection on fd: %d, host=%s, port=%s\n", fd, address,
+           port);
+  };
+  ws_client_t client = {.fd = fd, .address = address, .port = port};
+  return client;
 }
 
 void ws_print_ws_frame(ws_frame_t *frame) {
@@ -561,7 +542,7 @@ void ws_free_request(ws_request_t *req) {
   }
 }
 
-ws_frame_t ws_parse_ws_frame(uint8_t *buff) {
+ws_frame_t ws_parse_ws_frame(uint8_t *buff, size_t len) {
   assert(buff != NULL && "Buffer should not be NULL");
   ws_frame_t frame = {0};
   frame.fin = (buff[0] & O_FIN) >> 7;
@@ -593,6 +574,10 @@ ws_frame_t ws_parse_ws_frame(uint8_t *buff) {
   memset(payload, '\0', payload_len + 1);
 
   memcpy(payload, buff + offset, payload_len);
+  offset += payload_len;
+
+  printf("offset: %zu, payload_len: %zu\n", offset, len);
+  assert(offset == len && "Did not parse the frame correctly.");
 
   if (frame.masked) {
     ws_unmask_payload(payload, payload_len, frame.mask_key);
@@ -601,99 +586,174 @@ ws_frame_t ws_parse_ws_frame(uint8_t *buff) {
   return frame;
 }
 
-void free_ws_frame_data(ws_frame_t *frame_data) {
-  assert(frame_data != NULL && "Cannot free frame data = NULL");
-  if (frame_data != NULL) {
-    free(frame_data->payload);
+void ws_free_frame(ws_frame_t *frame) {
+  assert(frame != NULL && "Cannot free frame data = NULL");
+  if (frame != NULL) {
+    free(frame->payload);
   }
 }
 
-void ws_server_start(ws_server *server) {
+typedef struct {
+  char *msg;
+  size_t n;
+} ws_message_t;
+
+void ws_on_message(ws_server_t *server, ws_on_message_t *on_message) {
+  server->on_message = on_message;
+}
+
+#define MAX_EVENTS 100
+
+void ws_server_start(ws_server_t *server) {
+  assert(server != NULL && "Server should not be NULL");
+  struct epoll_event ev, events[MAX_EVENTS];
+  int epoll_fd = epoll_create(server->max_conn);
+  if (epoll_fd == -1) {
+    ws_panic("Could not create epoll fd.");
+  }
+  ev.events = EPOLLIN;
+  ev.data.fd = server->fd;
+
+  if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server->fd, &ev) == -1) {
+    ws_panic("Could not add server fd to epoll.");
+  }
+
+  int n, i, client_fd;
+
   while (true) {
-    struct sockaddr_in addr = {0};
-    socklen_t addr_len = sizeof(addr);
-    ws_log("Waiting for connections");
-    int client_fd =
-        accept(server->server_fd, (struct sockaddr *)&addr, &addr_len);
-    if (client_fd == -1) {
-      ws_die("server accept");
-    };
-    char *buf = (char *)malloc(MAX_MSG_LEN * sizeof(char));
-    size_t n = MAX_MSG_LEN;
-    if (recv(client_fd, buf, n, 0) == -1) {
-      ws_die("server read request");
-    };
-    ws_request_t *req = ws_parse_request(buf);
-    free(buf);
-    ws_print_request(req);
-    if (req == NULL) {
-      ws_log("Could not parse request");
-      ws_write_http_response(client_fd, 400, "sorry bro", NULL);
-      ws_close_connection(client_fd);
-      continue;
+    ws_log("wait now");
+    n = epoll_wait(epoll_fd, events, MAX_EVENTS, 30000);
+    if (n == -1) {
+      ws_panic("could not wait for events.");
     }
-    if (!ws_is_websocket_conn(req)) {
-      ws_log("Not a websocket connection");
-      ws_write_http_response(client_fd, 400,
-                             "Only websocket connections are accepted.", NULL);
-      ws_close_connection(client_fd);
-      continue;
-    }
-    const char *sec_ws_key = ws_get_header(req, "Sec-WebSocket-Key");
-    if (sec_ws_key == NULL) {
-      ws_log("Sec-WebSocket-Key header is missing.");
-      ws_headers hdrs = {0};
-      ws_headers_append(&hdrs, ws_make_header("Content-Type", "json"));
-      ws_write_http_response(
-          client_fd, 400, "{\"error\": \"we shill websocket connection sir.\"}",
-          &hdrs);
-      ws_free_headers(&hdrs);
-      ws_close_connection(client_fd);
-      continue;
-    }
-    char *accept_key = ws_make_accept_key(sec_ws_key);
-    ws_headers headers = {0};
-    ws_headers_append(&headers, ws_make_header("Upgrade", "websocket"));
-    ws_headers_append(&headers, ws_make_header("Connection", "Upgrade"));
-    ws_headers_append(&headers,
-                      ws_make_header("Sec-WebSocket-Accept", accept_key));
-
-    ws_write_http_response(client_fd, 101, "", &headers);
-    ws_free_headers(&headers);
-    ws_add_client(server, client_fd);
-
-    uint8_t *buff = (uint8_t *)malloc(MAX_MSG_LEN);
-    memset(buff, '\0', MAX_MSG_LEN);
-
-    ws_log("Waiting for messages");
-    while (recv(client_fd, buff, n, 0) > 0) {
-      ws_frame_t frame = ws_parse_ws_frame(buff);
-      ws_log("Received Frame: ");
-      ws_print_ws_frame(&frame);
-      if (!frame.fin ||
-          (frame.opcode != O_OPCODE_TXT && frame.opcode != O_OPCODE_BIN &&
-           frame.opcode != O_OPCODE_CLOSE && frame.opcode != O_OPCODE_CONT)) {
+    for (i = 0; i < n; ++i) {
+      if ((events[i].events & EPOLLERR) || (events[i].events & EPOLLHUP) ||
+          !(events[i].events & EPOLLIN)) {
+        ws_error("epoll error");
+        close(events[i].data.fd);
         continue;
       }
-      if (frame.opcode == O_OPCODE_CLOSE) {
-        ws_log("OPCODE: Closing connection");
-        ws_close_connection(client_fd);
-        break;
-      }
-      if (ws_send_ws_msg(client_fd, frame.payload, ws_get_payload_len(&frame),
-                         O_OPCODE_TXT | O_FIN) == -1) {
-        ws_error("Could not send message");
-      };
-      memset(buff, '\0', MAX_MSG_LEN);
-      free_ws_frame_data(&frame);
-    }
-    ws_log("Connection closed");
-    free(buff);
-    // ws_close_connection(client_fd);
-  }
-}
 
-int main(void) {
-  ws_server server = ws_server_new(8080, "127.0.0.1");
-  ws_server_start(&server);
+      client_fd = events[i].data.fd;
+
+      if (events[i].data.fd == server->fd) {
+        struct sockaddr_in addr = {0};
+        socklen_t addr_len = sizeof(addr);
+        client_fd = accept(server->fd, (struct sockaddr *)&addr, &addr_len);
+        printf("CLIENT FD: %d\n", client_fd);
+        if (client_fd == -1) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            ws_error("try again");
+            continue;
+          }
+          ws_error("Could not accept");
+          continue;
+        }
+        if (setnonblocking(client_fd) == -1) {
+          ws_panic("could not make client non blocking.");
+        };
+        ev.data.fd = client_fd;
+        ev.events = EPOLLIN;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
+          ws_panic("could not add client fd to epoll list.");
+        };
+      } else {
+        char *buf = (char *)malloc(MAX_MSG_LEN * sizeof(char));
+        size_t n = MAX_MSG_LEN;
+
+        printf("searching for fd: %d\n", events[i].data.fd);
+
+        for (int j = 0; j < server->client_n; ++j) {
+          printf("=%d=\n", server->client_fds[j]);
+          if (client_fd == server->client_fds[j]) {
+            int len = recv(client_fd, buf, n, O_NONBLOCK);
+            if (len == -1) {
+              if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                ws_error("try again");
+              }
+              ws_error("No more data to read");
+              continue;
+            }
+            ws_frame_t frame = ws_parse_ws_frame((uint8_t *)buf, len);
+            ws_log("Received Frame: ");
+            ws_print_ws_frame(&frame);
+            if (!frame.fin ||
+                (frame.opcode != O_OPCODE_TXT && frame.opcode != O_OPCODE_BIN &&
+                 frame.opcode != O_OPCODE_CLOSE &&
+                 frame.opcode != O_OPCODE_CONT)) {
+              continue;
+            }
+            if (frame.opcode == O_OPCODE_CLOSE) {
+              ws_log("OPCODE: Closing connection");
+              ws_close_connection(client_fd);
+              break;
+            }
+            ws_free_frame(&frame);
+            continue;
+            // if (ws_send_ws_msg(client_fd, frame.payload,
+            //                    ws_get_payload_len(&frame),
+            //                    O_OPCODE_TXT | O_FIN) == -1) {
+            //   ws_error("Could not send message");
+            // };
+            // memset(buf, '\0', MAX_MSG_LEN);
+            // ws_free_frame(&frame);
+            // ws_log("Connection closed");
+            // free(buf);
+            // continue;
+          }
+          printf("\n");
+        }
+
+        if (recv(client_fd, buf, n, O_NONBLOCK) == -1) {
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            ws_error("try again");
+            continue;
+          }
+          ws_error("could not read on client fd.");
+          continue;
+        };
+
+        ws_request_t *req = ws_parse_request(buf);
+        ws_print_request(req);
+
+        if (req == NULL) {
+          ws_log("Could not parse request");
+          ws_write_http_response(client_fd, 400, "sorry bro", NULL);
+          ws_close_connection(client_fd);
+          continue;
+        }
+        if (!ws_is_websocket_conn(req)) {
+          ws_log("Not a websocket connection");
+          ws_write_http_response(
+              client_fd, 400, "Only websocket connections are accepted.", NULL);
+          ws_close_connection(client_fd);
+          continue;
+        }
+        const char *sec_ws_key = ws_get_header(req, "Sec-WebSocket-Key");
+        if (sec_ws_key == NULL) {
+          ws_log("Sec-WebSocket-Key header is missing.");
+          ws_headers hdrs = {0};
+          ws_headers_append(&hdrs, ws_make_header("Content-Type", "json"));
+          ws_write_http_response(
+              client_fd, 400,
+              "{\"error\": \"we shill websocket connection sir.\"}", &hdrs);
+          ws_free_headers(&hdrs);
+          ws_close_connection(client_fd);
+          continue;
+        }
+        char *accept_key = ws_make_accept_key(sec_ws_key);
+        ws_headers headers = {0};
+        ws_headers_append(&headers, ws_make_header("Upgrade", "websocket"));
+        ws_headers_append(&headers, ws_make_header("Connection", "Upgrade"));
+        ws_headers_append(&headers,
+                          ws_make_header("Sec-WebSocket-Accept", accept_key));
+
+        ws_write_http_response(client_fd, 101, "", &headers);
+        ws_free_headers(&headers);
+
+        // ws_add_client(server, ws_make_client(client_fd, addr, addr_len));
+        ws_add_client_fd(server, client_fd);
+      }
+    }
+  }
 }
