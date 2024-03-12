@@ -1,6 +1,5 @@
 #ifndef ws_h
 #define ws_h
-#include "base64.h"
 #include "sha1.h"
 #include <arpa/inet.h>
 #include <assert.h>
@@ -45,7 +44,7 @@ typedef struct {
   size_t count;
   size_t capacity;
   ws_client_t *items;
-	size_t last_removed;
+  size_t last_removed;
 } ws_clients;
 
 typedef struct ws_header_t {
@@ -141,9 +140,9 @@ extern int setnonblocking(int fd);
 
 extern const char *ws_get_status_reason(const uint16_t code);
 
-extern bool ws_is_websocket_conn(ws_request_t *req);
+extern bool ws_is_websocket_conn(ws_request_t *);
 
-extern void ws_close_connection(const int fd);
+extern void ws_close_connection(ws_server_t *, const int);
 
 extern char *ws_headers_to_str(ws_headers *hdrs);
 

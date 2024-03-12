@@ -1,4 +1,6 @@
 #include "ws.h"
+#define BASE64_ENC_IMPLEMENTATION
+#include "base64.h"
 
 static const size_t MAX_MSG_LEN = 125 * 1024;
 static const char *WS_SHA_SUFFIX = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -309,7 +311,7 @@ bool ws_is_websocket_conn(ws_request_t *req) {
   return true;
 }
 
-void ws_close_connection(const int fd) {
+void ws_close_connection(ws_server_t *server, const int fd) {
   if (close(fd) == -1) {
     ws_error("Could not close connection");
   };
@@ -502,10 +504,10 @@ char *ws_make_accept_key(const char *sec_ws_key) {
   SHA1Result(&sha1, (uint8_t *)hash);
 
   // COMMENT: the length of encoded key would be 28 (4*ceil(input/3)).
-  char *enc_key = (char *)malloc(29);
-  memset(enc_key, '\0', 29);
+  // char *enc_key = (char *)malloc(29);
+  // memset(enc_key, '\0', 29);
 
-  Base64encode(enc_key, hash, 20);
+  char *enc_key = (char *)base64_encode((byte *)hash, 20);
 
   free(hash);
   free(new_key);
@@ -662,7 +664,7 @@ void ws_server_start(ws_server_t *server) {
             }
             if (frame.opcode == O_OPCODE_CLOSE) {
               ws_log("OPCODE: Closing connection");
-              ws_close_connection(client_fd);
+              ws_close_connection(&server, client_fd);
               goto reset;
             }
             if (server->on_message != NULL) {
