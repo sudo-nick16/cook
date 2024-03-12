@@ -1,12 +1,12 @@
+#ifndef BASE64_ENC
+#define BASE64_ENC
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 typedef uint8_t byte;
-
-#ifndef BASE64_ENC
-#define BASE64_ENC
 
 #ifdef __cplusplus
 extern "C" {

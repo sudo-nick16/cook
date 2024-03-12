@@ -217,8 +217,14 @@ ws_server_t ws_server_new(const uint16_t port, const char *address) {
   server.address = (char *)address;
   server.max_conn = 1000;
   ws_clients clients = {
+      .removed =
+          {
+              .count = 0,
+              .capacity = server.max_conn,
+              .items = (long *)malloc(sizeof(long) * server.max_conn),
+          },
       .count = 0,
-      .capacity = 0,
+      .capacity = server.max_conn,
       .items = (ws_client_t *)malloc(sizeof(ws_client_t) * server.max_conn)};
   server.clients = clients;
   int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -311,12 +317,6 @@ bool ws_is_websocket_conn(ws_request_t *req) {
   return true;
 }
 
-void ws_close_connection(ws_server_t *server, const int fd) {
-  if (close(fd) == -1) {
-    ws_error("Could not close connection");
-  };
-}
-
 char *ws_headers_to_str(ws_headers *hdrs) {
   assert(hdrs != NULL && "Headers are null.");
   size_t hdrs_len = 0;
@@ -372,11 +372,33 @@ int ws_write_http_response(const int fd, uint16_t code, const char *msg,
   return 0;
 }
 
+void ws_arr_push(ws_arr_long_t *arr, long item) {
+  if (arr->count >= arr->capacity) {
+    arr->capacity = arr->capacity == 0 ? 1000 : arr->capacity * 1.25;
+    arr->items = (long *)realloc(arr->items, arr->capacity * sizeof(long));
+    assert(arr != NULL && "Null after reallocation");
+  }
+  arr->items[arr->count++] = item;
+}
+
+long ws_arr_pop(ws_arr_long_t *arr) {
+  if (arr->count > 0) {
+    arr->count--;
+    return arr->items[arr->count];
+  }
+  return -1;
+}
+
 void ws_clients_append(ws_clients *clients, ws_client_t client) {
+  long rem_i = ws_arr_pop(&clients->removed);
+  if (rem_i != -1) {
+    printf("===Reusing the client=== %ld\n", rem_i);
+    clients->items[rem_i] = client;
+    return;
+  }
   if (clients->count >= clients->capacity) {
-    clients->capacity = clients->capacity == 0 ? 2 : clients->capacity * 2;
     if (clients->capacity == 0) {
-      clients->capacity = 2;
+      clients->capacity = 1000;
     } else if (clients->capacity <= 1000) {
       clients->capacity *= 2;
     } else {
@@ -387,6 +409,14 @@ void ws_clients_append(ws_clients *clients, ws_client_t client) {
     assert(clients != NULL && "Null after reallocation");
   }
   clients->items[clients->count++] = client;
+}
+
+void ws_close_connection(ws_server_t *server, const size_t i) {
+  ws_arr_push(&server->clients.removed, i);
+  if (close(server->clients.items[i].fd) == -1) {
+    ws_error("Could not close the connection");
+  };
+  server->clients.items[i].fd = -1;
 }
 
 ws_client_t ws_make_client(int fd, struct sockaddr_in *addr, socklen_t len) {
@@ -621,6 +651,9 @@ void ws_server_start(ws_server_t *server) {
         continue;
       }
       client_fd = events[i].data.fd;
+      if (client_fd == -1) {
+        continue;
+      }
       if (events[i].data.fd == server->fd) {
         client_fd = accept(server->fd, (struct sockaddr *)&addr, &addr_len);
         if (client_fd == -1) {
@@ -643,6 +676,7 @@ void ws_server_start(ws_server_t *server) {
         };
       } else {
         for (size_t j = 0; j < server->clients.count; ++j) {
+          printf("%d \n", server->clients.items[j].fd);
           if (client_fd == server->clients.items[j].fd) {
             is_existing_ws_conn = true;
             int len = recv(client_fd, buf, buf_len, O_NONBLOCK);
@@ -664,7 +698,7 @@ void ws_server_start(ws_server_t *server) {
             }
             if (frame.opcode == O_OPCODE_CLOSE) {
               ws_log("OPCODE: Closing connection");
-              ws_close_connection(&server, client_fd);
+              ws_close_connection(server, j);
               goto reset;
             }
             if (server->on_message != NULL) {
@@ -693,14 +727,14 @@ void ws_server_start(ws_server_t *server) {
           ws_log("Could not parse request");
           ws_write_http_response(client_fd, 400,
                                  "Request so bad I couldn't read", NULL);
-          ws_close_connection(client_fd);
+          close(client_fd);
           goto reset;
           continue;
         }
         if (!ws_is_websocket_conn(req)) {
           ws_write_http_response(
               client_fd, 400, "Only websocket connections are accepted.", NULL);
-          ws_close_connection(client_fd);
+          close(client_fd);
           goto reset;
           continue;
         }
@@ -713,7 +747,7 @@ void ws_server_start(ws_server_t *server) {
               client_fd, 400,
               "{\"error\": \"we shill websocket connection sir.\"}", &hdrs);
           ws_free_headers(&hdrs);
-          ws_close_connection(client_fd);
+          close(client_fd);
           goto reset;
         }
         char *accept_key = ws_make_accept_key(sec_ws_key);

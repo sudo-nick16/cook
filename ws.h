@@ -34,6 +34,12 @@
 #define M_PAYLOAD_LEN 0x7F  // b0111 1111
 #define M_MASK 0x80         // b1000 0000
 
+typedef struct {
+  long *items;
+  size_t count;
+  size_t capacity;
+} ws_arr_long_t;
+
 typedef struct ws_client_t {
   int fd;
   char *address;
@@ -44,7 +50,7 @@ typedef struct {
   size_t count;
   size_t capacity;
   ws_client_t *items;
-  size_t last_removed;
+  ws_arr_long_t removed;
 } ws_clients;
 
 typedef struct ws_header_t {
@@ -142,7 +148,9 @@ extern const char *ws_get_status_reason(const uint16_t code);
 
 extern bool ws_is_websocket_conn(ws_request_t *);
 
-extern void ws_close_connection(ws_server_t *, const int);
+extern void ws_close_connection(ws_server_t *, const size_t);
+
+void ws_clients_remove_client(ws_clients *clients, size_t i);
 
 extern char *ws_headers_to_str(ws_headers *hdrs);
 
