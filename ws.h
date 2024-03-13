@@ -43,7 +43,7 @@ typedef struct {
 typedef struct ws_client_t {
   int fd;
   char *address;
-  char *port;
+  uint16_t port;
 } ws_client_t;
 
 typedef struct {
@@ -92,18 +92,24 @@ typedef struct ws_server_t ws_server_t;
 typedef void(ws_on_message_t)(const ws_server_t *, const ws_client_t *,
                               const char *, const size_t);
 
+typedef void(ws_on_close_t)();
+
+typedef void(ws_on_open_t)();
+
 typedef struct ws_server_t {
   uint16_t port;
   char *address;
   int fd;
   ws_clients clients;
   size_t max_conn;
+  ws_on_open_t *on_open;
   ws_on_message_t *on_message;
+  ws_on_close_t *on_close;
 } ws_server_t;
 
 typedef struct ws_status_t {
   uint16_t code;
-  char *reason;
+  const char *reason;
 } ws_status_t;
 
 #define ws_status_n 3
@@ -123,6 +129,8 @@ extern uint8_t *ws_unmask_payload(uint8_t *s, size_t len, uint8_t *mask_key);
 
 extern ws_frame_t ws_make_ws_frame(uint8_t *payload, size_t payload_len,
                                    uint16_t options);
+
+extern ws_frame_t ws_make_close_frame(const uint16_t status_code);
 
 extern void ws_headers_append(ws_headers *headers, ws_header_t header);
 
@@ -188,6 +196,10 @@ extern void ws_free_frame(ws_frame_t *frame);
 extern ws_server_t ws_server_new(const uint16_t port, const char *address);
 
 extern void ws_on_message(ws_server_t *server, ws_on_message_t *on_message);
+
+extern void ws_on_open(ws_server_t *server, ws_on_open_t *on_open);
+
+extern void ws_on_close(ws_server_t *server, ws_on_close_t *on_close);
 
 extern void ws_server_start(ws_server_t *server);
 

@@ -9,6 +9,10 @@ static const int MSG = 2;
 
 std::map<std::string, std::vector<ws_client_t *>> rooms;
 
+void on_close() { printf("client closed the conection.\n"); }
+
+void on_open() { printf("opened the conection.\n"); }
+
 void on_message(const ws_server_t *server, const ws_client_t *client,
                 const char *msg, const size_t len) {
   std::string s = std::string(msg);
@@ -24,10 +28,12 @@ void on_message(const ws_server_t *server, const ws_client_t *client,
     if (s[i] == ' ') {
       message.push_back(s.substr(prev, i - prev));
       prev = i + 1;
+      token_count++;
     }
     if (i == s.length() - 1) {
       message.push_back(s.substr(prev, i - prev + 1));
       prev = i + 1;
+      token_count++;
     }
   }
   printf("message: len: %ld\n", message.size());
@@ -46,7 +52,7 @@ void on_message(const ws_server_t *server, const ws_client_t *client,
     }
   }
   printf("rooms size: %ld", rooms.size());
-  if (message.size() == 3 && message[COMMAND] == "emit") {
+  if (message.size() >= 3 && message[COMMAND] == "emit") {
     std::string room_id = message[ROOM_ID];
     printf("room- id: %s\n", room_id.c_str());
     std::string txt = message[MSG];
@@ -65,7 +71,9 @@ void on_message(const ws_server_t *server, const ws_client_t *client,
 int main(void) {
   printf("pid: %ld, ppid: %ld\n", (long)getpid(), (long)getppid());
   ws_server_t server = ws_server_new(8080, "127.0.0.1");
+  ws_on_open(&server, on_open);
   ws_on_message(&server, on_message);
+  ws_on_close(&server, on_close);
   ws_server_start(&server);
   return 0;
 }

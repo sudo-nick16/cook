@@ -4,6 +4,7 @@
 
 static const size_t MAX_MSG_LEN = 125 * 1024;
 static const char *WS_SHA_SUFFIX = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+static const byte SHA1_HASH_LEN = 20;
 
 const uint8_t WS_LEN_IS_2BYTES = 126;
 const uint8_t WS_LEN_IS_8BYTES = 127;
@@ -216,16 +217,19 @@ ws_server_t ws_server_new(const uint16_t port, const char *address) {
   server.port = port;
   server.address = (char *)address;
   server.max_conn = 1000;
+  server.on_message = NULL;
+  server.on_close = NULL;
   ws_clients clients = {
-      .removed =
-          {
-              .count = 0,
-              .capacity = server.max_conn,
-              .items = (long *)malloc(sizeof(long) * server.max_conn),
-          },
       .count = 0,
       .capacity = server.max_conn,
-      .items = (ws_client_t *)malloc(sizeof(ws_client_t) * server.max_conn)};
+      .items = (ws_client_t *)malloc(sizeof(ws_client_t) * server.max_conn),
+      .removed =
+          {
+              .items = (long *)malloc(sizeof(long) * server.max_conn),
+              .count = 0,
+              .capacity = server.max_conn,
+          },
+  };
   server.clients = clients;
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd == -1) {
@@ -346,7 +350,7 @@ int ws_write_http_response(const int fd, uint16_t code, const char *msg,
   assert(msg != NULL && "Message should not be NULL");
   const char *reason = ws_get_status_reason(code);
   const char *http_version = "HTTP/1.1";
-  char *headers = "";
+  char *headers = NULL;
   if (hdrs != NULL) {
     headers = ws_headers_to_str(hdrs);
   }
@@ -420,17 +424,11 @@ void ws_close_connection(ws_server_t *server, const size_t i) {
 }
 
 ws_client_t ws_make_client(int fd, struct sockaddr_in *addr, socklen_t len) {
-  char *address = (char *)malloc(30);
-  char *port = (char *)malloc(30);
-  memset(address, '\0', 30);
-  memset(port, '\0', 30);
-  if (getnameinfo((struct sockaddr *)addr, len, address, 30, port, 30,
-                  NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-    ws_error("Could not get name info.");
-  };
-  printf("Acception connection on fd: %d, host=%s, port=%s\n", fd, address,
-         port);
-  ws_client_t client = {.fd = fd, .address = address, .port = port};
+  ws_client_t client = {.fd = fd,
+                        .address = inet_ntoa(addr->sin_addr),
+                        .port = be16toh(addr->sin_port)};
+  printf("Acception connection on fd: %d, host=%s, port=%d\n", fd,
+         client.address, client.port);
   return client;
 }
 
@@ -526,18 +524,15 @@ int ws_send_ws_msg(int client_fd, const uint8_t *msg, size_t msg_len,
 char *ws_make_accept_key(const char *sec_ws_key) {
   assert(sec_ws_key != NULL && "Sec-WebSocket-Key should not be NULL");
   char *new_key = ws_concat_str(sec_ws_key, WS_SHA_SUFFIX);
-  char *hash = (char *)malloc(sizeof(uint8_t) * 20); // SHA1 hash is 20 bytes
+  char *hash =
+      (char *)malloc(sizeof(uint8_t) * SHA1_HASH_LEN); // SHA1 hash is 20 bytes
 
   SHA1Context sha1 = {0};
   SHA1Reset(&sha1);
   SHA1Input(&sha1, (uint8_t *)new_key, strlen(new_key));
   SHA1Result(&sha1, (uint8_t *)hash);
 
-  // COMMENT: the length of encoded key would be 28 (4*ceil(input/3)).
-  // char *enc_key = (char *)malloc(29);
-  // memset(enc_key, '\0', 29);
-
-  char *enc_key = (char *)base64_encode((byte *)hash, 20);
+  char *enc_key = (char *)base64_encode((byte *)hash, SHA1_HASH_LEN);
 
   free(hash);
   free(new_key);
@@ -613,6 +608,22 @@ void ws_free_frame(ws_frame_t *frame) {
 
 void ws_on_message(ws_server_t *server, ws_on_message_t *on_message) {
   server->on_message = on_message;
+}
+
+void ws_on_open(ws_server_t *server, ws_on_open_t *on_open) {
+  server->on_open = on_open;
+}
+
+void ws_on_close(ws_server_t *server, ws_on_close_t *on_close) {
+  server->on_close = on_close;
+}
+
+ws_frame_t ws_make_close_frame(const uint16_t status_code) {
+  uint16_t nosc = htobe16(status_code);
+  uint8_t sc[2] = {0};
+  sc[0] = nosc & 0xFF00;
+  sc[1] = nosc & 0x00FF;
+  return ws_make_ws_frame(sc, 2, O_FIN | O_OPCODE_CLOSE);
 }
 
 #define MAX_EVENTS 100
@@ -697,7 +708,9 @@ void ws_server_start(ws_server_t *server) {
               goto reset;
             }
             if (frame.opcode == O_OPCODE_CLOSE) {
-              ws_log("OPCODE: Closing connection");
+              if (server->on_close != NULL) {
+                server->on_close();
+              }
               ws_close_connection(server, j);
               goto reset;
             }
@@ -762,6 +775,7 @@ void ws_server_start(ws_server_t *server) {
 
         ws_clients_append(&server->clients,
                           ws_make_client(client_fd, &addr, addr_len));
+        server->on_open();
       }
     reset:
       memset(buf, '\0', MAX_MSG_LEN);

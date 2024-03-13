@@ -12,7 +12,7 @@ typedef uint8_t byte;
 extern "C" {
 #endif
 
-extern const char ENCODING[65];
+extern const char ENCODING[64];
 extern byte *base64_encode(byte *s, size_t s_len);
 
 #ifdef __cplusplus
@@ -20,14 +20,14 @@ extern byte *base64_encode(byte *s, size_t s_len);
 #endif
 
 #ifdef BASE64_ENC_IMPLEMENTATION
-const char ENCODING[65] = {
+const char ENCODING[64] = {
     'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
     'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
     'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/', '='};
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/'};
 
-static const byte PAD_I = 64;
+static const char PAD = '=';
 
 byte *base64_encode(byte *s, size_t s_len) {
   size_t enc_len = 4 * ((s_len + 3 - 1) / 3);
@@ -45,8 +45,8 @@ byte *base64_encode(byte *s, size_t s_len) {
       enc[off++] = ENCODING[((s[i] & 0x03) << 4) | ((s[i + 1] & 0xF0) >> 4)];
     } else {
       enc[off++] = ENCODING[(s[i] & 0x03) << 4];
-      enc[off++] = ENCODING[PAD_I];
-      enc[off++] = ENCODING[PAD_I];
+      enc[off++] = PAD;
+      enc[off++] = PAD;
       break;
     }
     if (i + 2 < s_len) {
@@ -54,7 +54,7 @@ byte *base64_encode(byte *s, size_t s_len) {
           ENCODING[((s[i + 1] & 0x0F) << 2) | ((s[i + 2] & 0xC0) >> 6)];
     } else {
       enc[off++] = ENCODING[(s[i + 1] & 0x0F) << 2];
-      enc[off++] = ENCODING[PAD_I];
+      enc[off++] = PAD;
       break;
     }
     enc[off++] = ENCODING[s[i + 2] & 0x3F];
