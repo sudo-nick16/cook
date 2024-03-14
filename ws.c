@@ -2,6 +2,8 @@
 #define BASE64_ENC_IMPLEMENTATION
 #include "base64.h"
 
+#define MAX_EVENTS 100
+
 static const size_t MAX_MSG_LEN = 125 * 1024;
 static const char *WS_SHA_SUFFIX = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 static const byte SHA1_HASH_LEN = 20;
@@ -500,6 +502,10 @@ ws_byte_arr_t ws_serialize_ws_frame(ws_frame_t *frame) {
 int ws_send_ws_frame(int client_fd, ws_frame_t *frame) {
   ws_byte_arr_t s = ws_serialize_ws_frame(frame);
   if (write(client_fd, s.data, s.len) == -1) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      ws_log("try again");
+      return 1;
+    }
     ws_error("Could not write to the connection");
     return -1;
   }
@@ -619,14 +625,11 @@ void ws_on_close(ws_server_t *server, ws_on_close_t *on_close) {
 }
 
 ws_frame_t ws_make_close_frame(const uint16_t status_code) {
-  uint16_t nosc = htobe16(status_code);
-  uint8_t sc[2] = {0};
-  sc[0] = nosc & 0xFF00;
-  sc[1] = nosc & 0x00FF;
+  uint8_t *sc = (uint8_t *)malloc(2);
+  sc[0] = (status_code & 0xFF00) >> 8;
+  sc[1] = status_code & 0x00FF;
   return ws_make_ws_frame(sc, 2, O_FIN | O_OPCODE_CLOSE);
 }
-
-#define MAX_EVENTS 100
 
 void ws_server_start(ws_server_t *server) {
   assert(server != NULL && "Server should not be NULL");
